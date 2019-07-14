@@ -10,7 +10,6 @@ import {
   FoldoutType,
   ICompareFormUpdate,
   RepositorySectionTab,
-  isRebaseConflictState,
   isMergeConflictState,
   RebaseConflictState,
 } from '../../lib/app-state'
@@ -196,22 +195,6 @@ export class Dispatcher {
     return this.appStore._setRepositoryFilterText(text)
   }
 
-  /** Set the branch filter text. */
-  public setBranchFilterText(
-    repository: Repository,
-    text: string
-  ): Promise<void> {
-    return this.appStore._setBranchFilterText(repository, text)
-  }
-
-  /** Set the branch filter text. */
-  public setPullRequestFilterText(
-    repository: Repository,
-    text: string
-  ): Promise<void> {
-    return this.appStore._setPullRequestFilterText(repository, text)
-  }
-
   /** Select the repository. */
   public selectRepository(
     repository: Repository | CloningRepository
@@ -333,17 +316,6 @@ export class Dispatcher {
   /** Close the specified foldout. */
   public closeFoldout(foldout: FoldoutType): Promise<void> {
     return this.appStore._closeFoldout(foldout)
-  }
-
-  /**
-   * Compute a preview of the planned rebase action
-   */
-  public previewRebase(
-    repository: Repository,
-    baseBranch: Branch,
-    targetBranch: Branch
-  ) {
-    return this.appStore._previewRebase(repository, baseBranch, targetBranch)
   }
 
   /** Initialize and start the rebase operation */
@@ -875,11 +847,13 @@ export class Dispatcher {
 
     const beforeSha = getTipSha(stateBefore.branchesState.tip)
 
-    log.info(`[rebase] starting rebase for ${targetBranch} at ${beforeSha}`)
+    log.info(
+      `[rebase] starting rebase for ${targetBranch.name} at ${beforeSha}`
+    )
     log.info(
       `[rebase] to restore the previous state if this completed rebase is unsatisfactory:`
     )
-    log.info(`[rebase] - git checkout ${targetBranch}`)
+    log.info(`[rebase] - git checkout ${targetBranch.name}`)
     log.info(`[rebase] - git reset ${beforeSha} --hard`)
 
     const result = await this.appStore._rebase(
@@ -916,11 +890,17 @@ export class Dispatcher {
         return
       }
 
-      this.switchToConflicts(repository, conflictState)
+      const conflictsWithBranches: RebaseConflictState = {
+        ...conflictState,
+        baseBranch: baseBranch.name,
+        targetBranch: targetBranch.name,
+      }
+
+      this.switchToConflicts(repository, conflictsWithBranches)
     } else if (result === RebaseResult.CompletedWithoutError) {
       if (tip.kind !== TipState.Valid) {
         log.warn(
-          `[continueRebase] tip after completing rebase is ${
+          `[rebase] tip after completing rebase is ${
             tip.kind
           } but this should be a valid tip if the rebase completed without error`
         )
@@ -937,6 +917,11 @@ export class Dispatcher {
         tip,
         beforeSha
       )
+    } else if (result === RebaseResult.Error) {
+      // we were unable to successfully start the rebase, and an error should
+      // be shown through the default error handling infrastructure, so we can
+      // just abandon the rebase for now
+      this.endRebaseFlow(repository)
     }
   }
 
@@ -953,19 +938,15 @@ export class Dispatcher {
   public async continueRebase(
     repository: Repository,
     workingDirectory: WorkingDirectoryStatus,
-    manualResolutions: ReadonlyMap<string, ManualConflictResolution>
+    conflictsState: RebaseConflictState
   ): Promise<void> {
     const stateBefore = this.repositoryStateManager.get(repository)
-    const { conflictState } = stateBefore.changesState
-
-    if (conflictState === null || !isRebaseConflictState(conflictState)) {
-      log.warn(
-        `[continueRebase] no conflicts found, likely an invalid rebase state`
-      )
-      return
-    }
-
-    const { targetBranch, baseBranch, originalBranchTip } = conflictState
+    const {
+      targetBranch,
+      baseBranch,
+      originalBranchTip,
+      manualResolutions,
+    } = conflictsState
 
     const beforeSha = getTipSha(stateBefore.branchesState.tip)
 
@@ -1004,7 +985,14 @@ export class Dispatcher {
         return
       }
 
-      this.switchToConflicts(repository, conflictState)
+      // ensure branches are persisted when transitioning back to conflicts
+      const conflictsWithBranches: RebaseConflictState = {
+        ...conflictState,
+        baseBranch,
+        targetBranch,
+      }
+
+      this.switchToConflicts(repository, conflictsWithBranches)
     } else if (result === RebaseResult.CompletedWithoutError) {
       if (tip.kind !== TipState.Valid) {
         log.warn(
@@ -2007,15 +1995,6 @@ export class Dispatcher {
     return this.commitStatusStore.subscribe(repository, ref, callback)
   }
 
-  /**
-   * Stashes all changes, including those in untracked files, in the working directory
-   *
-   * @param branch the branch the stash should be associated with
-   */
-  public createStash(repository: Repository, branch: Branch): Promise<void> {
-    return this.appStore._createStash(repository, branch.name)
-  }
-
   /** Drops the given stash in the given repository */
   public dropStash(repository: Repository, stashEntry: IStashEntry) {
     return this.appStore._dropStashEntry(repository, stashEntry)
@@ -2040,5 +2019,10 @@ export class Dispatcher {
    */
   public resetStashedFilesWidth = (): Promise<void> => {
     return this.appStore._resetStashedFilesWidth()
+  }
+
+  //** Hide the diff for stashed changes */
+  public hideStashedChanges(repository: Repository) {
+    return this.appStore._hideStashedChanges(repository)
   }
 }

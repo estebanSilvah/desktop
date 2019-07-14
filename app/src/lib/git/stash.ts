@@ -1,12 +1,14 @@
-import { git } from '.'
-import { Repository } from '../../models/repository'
 import { GitError as DugiteError } from 'dugite'
+
+import { Repository } from '../../models/repository'
 import {
   IStashEntry,
   StashedChangesLoadStates,
   StashedFileChanges,
 } from '../../models/stash-entry'
 import { CommittedFileChange } from '../../models/status'
+
+import { git, GitError } from './core'
 import { parseChangedFiles } from './log'
 
 export const DesktopStashEntryMarker = '!!GitHub_Desktop'
@@ -92,7 +94,31 @@ export async function createDesktopStashEntry(
 ) {
   const message = createDesktopStashMessage(branchName)
   const args = ['stash', 'push', '--include-untracked', '-m', message]
-  await git(args, repository.path, 'createStashEntry')
+
+  const result = await git(args, repository.path, 'createStashEntry', {
+    successExitCodes: new Set<number>([0, 1]),
+  })
+
+  if (result.exitCode === 1) {
+    // search for any line starting with `error:` -  /m here to ensure this is
+    // applied to each line, without needing to split the text
+    const errorPrefixRe = /^error: /m
+
+    const matches = errorPrefixRe.exec(result.stderr)
+    if (matches !== null && matches.length > 0) {
+      // rethrow, because these messages should prevent the stash from being created
+      throw new GitError(result, args)
+    }
+
+    // if no error messages were emitted by Git, we should log but continue because
+    // a valid stash was created and this should not interfere with the checkout
+
+    log.info(
+      `[createDesktopStashEntry] a stash was created successfully but exit code ${
+        result.exitCode
+      } reported. stderr: ${result.stderr}`
+    )
+  }
 }
 
 async function getStashEntryMatchingSha(repository: Repository, sha: string) {
@@ -131,11 +157,33 @@ export async function popStashEntry(
   // ignoring these git errors for now, this will change when we start
   // implementing the stash conflict flow
   const expectedErrors = new Set<DugiteError>([DugiteError.MergeConflicts])
+  const successExitCodes = new Set<number>([0, 1])
   const stashToPop = await getStashEntryMatchingSha(repository, stashSha)
 
   if (stashToPop !== null) {
-    const args = ['stash', 'pop', `${stashToPop.name}`]
-    await git(args, repository.path, 'popStashEntry', { expectedErrors })
+    const args = ['stash', 'pop', '--quiet', `${stashToPop.name}`]
+    const result = await git(args, repository.path, 'popStashEntry', {
+      expectedErrors,
+      successExitCodes,
+    })
+
+    // popping a stashes that create conflicts in the working directory
+    // report an exit code of `1` and are not dropped after being applied.
+    // so, we check for this case and drop them manually
+    if (result.exitCode === 1) {
+      if (result.stderr.length > 0) {
+        // rethrow, because anything in stderr should prevent the stash from being popped
+        throw new GitError(result, args)
+      }
+
+      log.info(
+        `[popStashEntry] a stash was popped successfully but exit code ${
+          result.exitCode
+        } reported.`
+      )
+      // bye bye
+      await dropDesktopStashEntry(repository, stashSha)
+    }
   }
 }
 
@@ -144,23 +192,59 @@ function extractBranchFromMessage(message: string): string | null {
   return match === null || match[1].length === 0 ? null : match[1]
 }
 
-/** Get the files that were changed in the given stash commit.
- *  This is different than `getChangedFiles` because stashes
- *  have _3 parents(!!!)_
+/**
+ * Get the files that were changed in the given stash commit.
  *
- * TODO: support showing untracked files in the diff
+ * This is different than `getChangedFiles` because stashes
+ * have _3 parents(!!!)_
  */
 export async function getStashedFiles(
   repository: Repository,
-  sha: string
+  stashSha: string
 ): Promise<ReadonlyArray<CommittedFileChange>> {
+  const [trackedFiles, untrackedFiles] = await Promise.all([
+    getChangedFilesWithinStash(repository, stashSha),
+    getChangedFilesWithinStash(repository, `${stashSha}^3`),
+  ])
+
+  const files = new Map<string, CommittedFileChange>()
+  trackedFiles.forEach(x => files.set(x.path, x))
+  untrackedFiles.forEach(x => files.set(x.path, x))
+  return [...files.values()].sort((x, y) => x.path.localeCompare(y.path))
+}
+
+/**
+ * Same thing as `getChangedFiles` but with extra handling for 128 exit code
+ * (which happens if the commit's parent is not valid)
+ *
+ * **TODO:** merge this with `getChangedFiles` in `log.ts`
+ */
+async function getChangedFilesWithinStash(repository: Repository, sha: string) {
   // opt-in for rename detection (-M) and copies detection (-C)
   // this is equivalent to the user configuring 'diff.renames' to 'copies'
   // NOTE: order here matters - doing -M before -C means copies aren't detected
-
-  // git diff -C -M --name-status -z [STASH_SHA] [STASH_SHA]^
-  const args = ['diff', '-C', '-M', '--name-status', '-z', sha, `${sha}^`, '--']
-  const result = await git(args, repository.path, 'getStashedFiles')
-
-  return parseChangedFiles(result.stdout, sha)
+  const args = [
+    'log',
+    sha,
+    '-C',
+    '-M',
+    '-m',
+    '-1',
+    '--no-show-signature',
+    '--first-parent',
+    '--name-status',
+    '--format=format:',
+    '-z',
+    '--',
+  ]
+  const result = await git(args, repository.path, 'getChangedFilesForStash', {
+    // if this fails, its most likely
+    // because there weren't any untracked files,
+    // and that's okay!
+    successExitCodes: new Set([0, 128]),
+  })
+  if (result.exitCode === 0 && result.stdout.length > 0) {
+    return parseChangedFiles(result.stdout, sha)
+  }
+  return []
 }
